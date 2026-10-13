@@ -15,6 +15,15 @@
 
 #include "cpu.h"
 
+#if NCNN_INT8 && NCNN_XSAI_AME
+// AME glue headers. Must be included at global scope (they pull system and
+// ame_xsa.h headers, which must not expand inside namespace ncnn).
+#include "convolution_int8_xsai.h"
+#endif
+#if NCNN_XSAI_AME
+#include "convolution_bf16_xsai.h"
+#endif
+
 namespace ncnn {
 
 #include "convolution_im2col_gemm.h"
@@ -54,7 +63,18 @@ int Convolution_riscv::create_pipeline(const Option& opt)
 #if NCNN_INT8
     if (opt.use_int8_inference && weight_data.elemsize == (size_t)1u)
     {
-        // TODO implement int8
+        // TODO implement int8 (stock rvv/scalar path); the XSAI AME int8
+        // drop-in prepacks its B tiles here (weights are already quantized:
+        // load_model quantizes fp32 -> int8 before create_pipeline runs).
+#if NCNN_XSAI_AME
+        if (xsai_conv_int8_ame_on())
+        {
+            const int maxk8 = kernel_w * kernel_h;
+            const int K8 = maxk8 * (weight_data_size / maxk8 / num_output);
+            const int tile_n8 = xsai_ame_tile_spec_get()->tile_n;
+            weight_int8_ame_data = xsai_conv_int8_prepack_weight(weight_data, num_output, K8, tile_n8);
+        }
+#endif
         return 0;
     }
 #endif
@@ -63,6 +83,19 @@ int Convolution_riscv::create_pipeline(const Option& opt)
     if (support_fp16_storage && opt.use_fp16_storage)
     {
         return create_pipeline_fp16s(opt);
+    }
+#endif
+
+#if NCNN_XSAI_AME
+    // XSAI AME bf16 prepack: only when the runtime gate could open (env
+    // XSAI_NCNN_AME_BF16), so ordinary builds pay nothing.
+    if (xsai_conv_bf16_ame_on())
+    {
+        const int maxkB = kernel_w * kernel_h;
+        const int num_inputB = weight_data_size / maxkB / num_output;
+        const int KB = maxkB * num_inputB;
+        const int tile_nB = xsai_ame_tile_spec_get()->tile_n;
+        weight_bf16_ame_data = xsai_conv_bf16_prepack_weight(weight_data, num_output, KB, tile_nB);
     }
 #endif
 
@@ -231,6 +264,16 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
 
         Option opt_unpacked = opt;
         opt_unpacked.use_packing_layout = false;
+#if NCNN_INT8 && NCNN_XSAI_AME
+        // XSAI AME int8 drop-in: capability- and shape-gated inside; any
+        // rejection returns -1 here and the stock kernel below handles it.
+        if (xsai_conv_int8_ame_on())
+        {
+            const int ret = forward_int8_xsai(bottom_blob_unpacked_fp32, top_blob, opt_unpacked);
+            if (ret == 0)
+                return 0;
+        }
+#endif
         return Convolution::forward_int8(bottom_blob_unpacked_fp32, top_blob, opt_unpacked);
     }
 #endif
@@ -287,6 +330,18 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
             return forward_fp16sa(bottom_blob, top_blob, opt);
         else
             return forward_fp16s(bottom_blob, top_blob, opt);
+    }
+#endif
+
+#if NCNN_XSAI_AME
+    // XSAI AME bf16 drop-in for the fp32 path (fp32 in/out, bf16 matmul
+    // inside). Capability- and prepack-gated; any rejection keeps the stock
+    // rvv/scalar path below.
+    if (bottom_blob.elempack == 1 && bottom_blob.elemsize == 4u && xsai_conv_bf16_ame_on())
+    {
+        const int ret = forward_bf16_xsai(bottom_blob, top_blob, opt);
+        if (ret == 0)
+            return 0;
     }
 #endif
 

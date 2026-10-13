@@ -687,6 +687,31 @@ if(NCNN_TARGET_ARCH STREQUAL "loongarch")
     endif()
 endif()
 
+if(NCNN_XSAI_AME AND NCNN_TARGET_ARCH STREQUAL "riscv")
+    # XSAI AME: ame_xsa.c is the ONLY TU with AME instructions (zames march);
+    # xsai_alloc.c provides the physically-contiguous operand pool.
+    # NCNN_XSAI_AME=1 also activates the int8 conv glue in
+    # src/layer/riscv/convolution_int8_xsai.h (env XSAI_NCNN_AME gates it at
+    # runtime; without the env the stock kernel runs unchanged).
+    target_compile_definitions(ncnn PRIVATE NCNN_XSAI_AME=1)
+    set(XSAI_AME_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../MNN/source/backend/cpu")
+    # AME 池编译期兜底（运行时优先看 XSAI_AME_RESERVED_BASE / DTB，见 MNN 的 xsai_alloc.c）
+    set(XSAI_RESERVED_PHYS_BASE_ADDR "0x100000000ULL" CACHE STRING "AME pool compile-time physical base")
+    set(XSAI_RESERVED_MEMORY_SIZE   "(64L*1024L*1024L)" CACHE STRING "AME pool compile-time size")
+    if(EXISTS ${XSAI_AME_SOURCE_DIR}/compute/ame_xsa.c)
+        list(APPEND NCNN_SRCS ${XSAI_AME_SOURCE_DIR}/compute/ame_xsa.c)
+        list(APPEND NCNN_SRCS ${XSAI_AME_SOURCE_DIR}/ame/xsai_alloc.c)
+        set_source_files_properties(${XSAI_AME_SOURCE_DIR}/compute/ame_xsa.c
+            PROPERTIES COMPILE_OPTIONS "-march=rv64gcv_zames_zmasync_zvl128b")
+        set_source_files_properties(${XSAI_AME_SOURCE_DIR}/ame/xsai_alloc.c
+            PROPERTIES COMPILE_OPTIONS "-DRESERVED_PHYS_BASE_ADDR=${XSAI_RESERVED_PHYS_BASE_ADDR};-DRESERVED_MEMORY_SIZE=${XSAI_RESERVED_MEMORY_SIZE}")
+        target_include_directories(ncnn PRIVATE
+            ${XSAI_AME_SOURCE_DIR}/compute
+            ${XSAI_AME_SOURCE_DIR}/ame
+        )
+    endif()
+endif()
+
 if(NCNN_TARGET_ARCH STREQUAL "riscv" AND NOT C906)
     if(CMAKE_SIZEOF_VOID_P EQUAL 8)
         if(NOT NCNN_RUNTIME_CPU AND NCNN_RVV)
